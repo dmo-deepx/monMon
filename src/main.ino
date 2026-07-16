@@ -191,7 +191,7 @@ static bool xbeeBootstrap() {
     delay(150);
     if (xbeeEnterCmdMode()) {
       Serial.printf("[XBee] transparent mode at %ld baud; converting to API\n", b);
-      xbeeCmd("ATAP1");                       // API without escapes
+      xbeeCmd("ATAP2");                       // escaped API (xbee-arduino requires it)
       xbeeCmd("ATBD7");                        // 115200 (applies on exit)
       xbeeCmd("ATWR");                         // persist
       xbeeCmd("ATCN");                         // exit command mode
@@ -213,12 +213,18 @@ static void configureXBeeNetwork() {
   uint8_t pan[2] = { (uint8_t)(MONMON_PAN_ID >> 8), (uint8_t)(MONMON_PAN_ID & 0xFF) };
   uint8_t ch     = MONMON_CHANNEL;
   uint8_t my[2]  = { (uint8_t)(roverAddr >> 8),     (uint8_t)(roverAddr & 0xFF) };
-  uint8_t zero = 0, one = 1, two = 2;
+  uint8_t zero = 0, two = 2;
 
-  // Framing personality: classic Series-1-compatible frames for xbee-arduino.
+  // Escaped API (AP=2) MUST be set first and applied: xbee-arduino always escapes
+  // its frames, so the module must match — otherwise bytes 0x7E/0x7D/0x11/0x13
+  // (common in RTCM data and in AT-frame checksums) corrupt the frame.
+  bool bAP = xbeeAt("AP", &two, 1);
+  xbeeAt("AC", nullptr, 0);
+  delay(100);
+
+  // Framing personality: Series-1-compatible frames for xbee-arduino.
   bool bMM = xbeeAt("MM", &zero, 1);   // Digi Mode (802.15.4 + Digi header): clean framing, ACKs + retries
   bool bAO = xbeeAt("AO", &two, 1);    // legacy 0x80/0x81 RX frames (carry per-packet RSSI)
-  bool bAP = xbeeAt("AP", &one, 1);    // non-escaped API
   bool bID = xbeeAt("ID", pan, 2);
   bool bCH = xbeeAt("CH", &ch, 1);
   bool bMY = xbeeAt("MY", my, 2);

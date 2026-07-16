@@ -39,22 +39,33 @@ class XBee802:
         self.ser = serial.Serial(self.port, baud, timeout=0.05)
         self._buf.clear()
 
-    @staticmethod
-    def _checksum(data: bytes) -> int:
-        return 0xFF - (sum(data) & 0xFF)
+    # ---- API mode 2 (escaped) framing --------------------------------------
+    # xbee-arduino always escapes, so the whole system runs AP=2. Bytes
+    # 0x7E/0x7D/0x11/0x13 after the start delimiter are escaped as
+    # 0x7D followed by (byte XOR 0x20). Required for binary RTCM.
+    _ESCAPE = 0x7D
+    _SPECIAL = (0x7E, 0x7D, 0x11, 0x13)
+
+    @classmethod
+    def _encode_frame(cls, data: bytes) -> bytes:
+        n = len(data)
+        chk = 0xFF - (sum(data) & 0xFF)
+        out = bytearray([0x7E])
+        for b in list(((n >> 8) & 0xFF, n & 0xFF)) + list(data) + [chk]:
+            if b in cls._SPECIAL:
+                out.append(cls._ESCAPE)
+                out.append(b ^ 0x20)
+            else:
+                out.append(b)
+        return bytes(out)
 
     def _write_frame(self, data: bytes) -> None:
-        n = len(data)
-        frame = bytes([0x7E, (n >> 8) & 0xFF, n & 0xFF]) + bytes(data)
-        frame += bytes([self._checksum(data)])
-        self.ser.write(frame)
+        self.ser.write(self._encode_frame(data))
 
-    def _read_frames(self) -> list[bytes]:
-        d = self.ser.read(512)
-        if d:
-            self._buf += d
+    @classmethod
+    def _extract_frames(cls, buf: bytearray) -> list[bytes]:
+        """Pull complete, unescaped frames out of buf, consuming what it uses."""
         out = []
-        buf = self._buf
         while True:
             i = buf.find(0x7E)
             if i < 0:
@@ -62,19 +73,47 @@ class XBee802:
                 break
             if i > 0:
                 del buf[:i]
-            if len(buf) < 3:
-                break
-            n = (buf[1] << 8) | buf[2]
-            if len(buf) < 3 + n + 1:
-                break
-            data = bytes(buf[3:3 + n])
-            chk = buf[3 + n]
-            del buf[:3 + n + 1]
-            if (sum(data) + chk) & 0xFF == 0xFF:
-                out.append(data)
-            elif self.debug:
-                print("  [xbee] bad checksum, dropped frame")
+            # Unescape from just after the start delimiter until we have a full frame.
+            unesc = bytearray()
+            j = 1
+            need = None
+            complete = False
+            while j < len(buf):
+                b = buf[j]
+                if b == 0x7E:            # unexpected delimiter -> current frame is junk
+                    break
+                if b == cls._ESCAPE:
+                    if j + 1 >= len(buf):
+                        j = len(buf)     # incomplete escape; wait for more
+                        break
+                    unesc.append(buf[j + 1] ^ 0x20)
+                    j += 2
+                else:
+                    unesc.append(b)
+                    j += 1
+                if need is None and len(unesc) >= 2:
+                    need = 2 + ((unesc[0] << 8) | unesc[1]) + 1
+                if need is not None and len(unesc) >= need:
+                    complete = True
+                    break
+            if complete:
+                n = (unesc[0] << 8) | unesc[1]
+                frame = bytes(unesc[2:2 + n])
+                chk = unesc[2 + n]
+                del buf[:j]
+                if (sum(frame) + chk) & 0xFF == 0xFF:
+                    out.append(frame)
+            elif j < len(buf) and buf[j] == 0x7E:
+                del buf[:j]              # drop the junk partial, resync on next delimiter
+            else:
+                break                    # incomplete; keep bytes and wait for more
         return out
+
+    def _read_frames(self) -> list[bytes]:
+        d = self.ser.read(512)
+        if d:
+            self._buf += d
+        return self._extract_frames(self._buf)
 
     # ---- AT commands --------------------------------------------------------
     def send_at(self, cmd: str, value: bytes = b"", frame_id: int = 1) -> None:
@@ -141,7 +180,7 @@ class XBee802:
             if self._enter_cmd_mode():
                 if self.debug:
                     print(f"  [xbee] transparent at {b} baud; converting")
-                self._cmd("ATAP1")
+                self._cmd("ATAP2")
                 self._cmd("ATBD7")
                 self._cmd("ATWR")
                 self._cmd("ATCN")
@@ -153,10 +192,15 @@ class XBee802:
 
     def configure(self, pan: int, channel: int, my: int) -> dict:
         """Force network params; returns which set calls succeeded."""
+        # AP=2 first and applied: escaped framing must match before sending any
+        # parameter whose frame might contain 0x7E/0x7D/0x11/0x13.
+        ap = self.at_set("AP", bytes([2]))
+        self.at_set("AC", b"")
+        time.sleep(0.1)
         res = {
+            "AP": ap,
             "MM": self.at_set("MM", bytes([0])),   # Digi Mode: clean framing + ACKs/retries
             "AO": self.at_set("AO", bytes([2])),   # legacy 0x80/0x81 RX frames (carry RSSI)
-            "AP": self.at_set("AP", bytes([1])),   # non-escaped API (match the rover)
             "ID": self.at_set("ID", bytes([(pan >> 8) & 0xFF, pan & 0xFF])),
             "CH": self.at_set("CH", bytes([channel])),
             "MY": self.at_set("MY", bytes([(my >> 8) & 0xFF, my & 0xFF])),

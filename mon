@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # monMon dev helper — wraps PlatformIO, which isn't on this machine's PATH.
-# Usage: ./mon <command> [extra pio args]   (run ./mon help for the list)
+# Usage: ./mon <command> [-p PORT] [extra pio args]   (run ./mon help for the list)
+#
+# -p PORT selects a board when several are attached. PORT may be a full path
+# (/dev/cu.usbmodemXXXX) or a substring (e.g. 1123301). Needed for multi-node.
 set -euo pipefail
 
 PIO="$HOME/.platformio/penv/bin/pio"
@@ -12,40 +15,76 @@ if [[ ! -x "$PIO" ]]; then
   exit 1
 fi
 
-# Put pio + its bundled tools on PATH for anything this script invokes, and
-# always operate on the monMon project regardless of the caller's cwd.
 export PATH="$HOME/.platformio/penv/bin:$PATH"
 cd "$PROJECT_DIR"
 
 cmd="${1:-build}"
 shift || true
 
+# Pull an optional "-p PORT" / "--port PORT" out of the args; keep the rest.
+PORT=""
+passthru=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--port) PORT="${2:-}"; shift 2 ;;
+    *)         passthru+=("$1"); shift ;;
+  esac
+done
+
+# Resolve a full port path from PORT (path or substring), or auto-pick the sole
+# ESP if PORT is empty. Prints the path on success; errors + lists on failure.
+pick_port() {
+  shopt -s nullglob            # non-matching globs expand to nothing
+  local m
+  if [[ -n "$PORT" ]]; then
+    if [[ "$PORT" == /dev/* ]]; then
+      echo "$PORT"; return 0   # explicit path; pio validates it
+    fi
+    m=( /dev/cu.*"$PORT"* )
+    if [[ ${#m[@]} -eq 1 ]]; then echo "${m[0]}"; return 0; fi
+    echo "error: no unique port matches '$PORT'. ESP ports attached:" >&2
+    ls /dev/cu.usbmodem* 2>/dev/null >&2 || true
+    return 1
+  fi
+  m=( /dev/cu.usbmodem* )
+  if [[ ${#m[@]} -eq 1 ]]; then echo "${m[0]}"; return 0; fi
+  echo "error: multiple/no ESP ports — pick one with -p <port|substr>:" >&2
+  ls /dev/cu.usbmodem* 2>/dev/null >&2 || true
+  return 1
+}
+
 case "$cmd" in
-  build|b)      exec "$PIO" run "$@" ;;
-  upload|u)     exec "$PIO" run -t upload "$@" ;;
-  monitor|m)    exec "$PIO" device monitor "$@" ;;
-  run|flash|r)  exec "$PIO" run -t upload -t monitor "$@" ;;
-  clean|c)      exec "$PIO" run -t clean "$@" ;;
-  ports|p)      exec "$PIO" device list "$@" ;;
-  pio)          exec "$PIO" "$@" ;;
+  build|b)   exec "$PIO" run "${passthru[@]}" ;;
+  clean|c)   exec "$PIO" run -t clean "${passthru[@]}" ;;
+  upload|u)  p=$(pick_port) || exit 1
+             exec "$PIO" run -t upload --upload-port "$p" "${passthru[@]}" ;;
+  monitor|m) p=$(pick_port) || exit 1
+             exec "$PIO" device monitor -p "$p" "${passthru[@]}" ;;
+  run|flash|r) p=$(pick_port) || exit 1
+             echo "==> target $p"
+             "$PIO" run -t upload --upload-port "$p" "${passthru[@]}"
+             exec "$PIO" device monitor -p "$p" ;;
+  ports|p)   exec "$PIO" device list "${passthru[@]}" ;;
+  pio)       exec "$PIO" "${passthru[@]}" ;;
   -h|--help|help)
     cat <<'EOF'
 monMon dev helper
-usage: ./mon <command> [extra pio args]
+usage: ./mon <command> [-p PORT] [extra pio args]
 
   build    (b)  compile firmware                     [default]
   upload   (u)  compile + flash over USB
   monitor  (m)  open serial monitor (115200 baud)
   run      (r)  upload then monitor        (alias: flash)
   clean    (c)  remove build artifacts
-  ports    (p)  list attached serial ports
+  ports    (p)  list attached boards (shows MAC/serial)
   pio ...       pass remaining args straight to pio
 
-examples:
-  ./mon                     # build
-  ./mon run                 # flash + watch serial
-  ./mon upload --upload-port /dev/cu.usbmodem1101
+-p PORT selects a board when several are attached (full path or a substring):
+  ./mon run -p 1123301        # flash+monitor that ESP
+  ./mon monitor -p 1123101    # monitor the other ESP
+  ./mon                        # build (no port needed)
+  ./mon run                    # only works when exactly one ESP is attached
 EOF
     ;;
-  *) exec "$PIO" "$cmd" "$@" ;;   # anything else -> raw pio subcommand
+  *) exec "$PIO" "$cmd" "${passthru[@]}" ;;
 esac
