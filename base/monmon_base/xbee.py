@@ -1,0 +1,195 @@
+"""Minimal XBee 3 (802.15.4) API-mode driver over pyserial.
+
+Mirrors the rover firmware: brings a module to API mode @ 115200 from any
+starting state, then talks 16-bit-addressed TX16 (0x01) / RX16 (0x81) frames.
+API mode 1 (non-escaped) to match the firmware's AP=1.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+
+import serial
+
+BAUDS = [115200, 9600, 38400, 57600, 19200, 230400]
+BROADCAST = 0xFFFF
+
+
+@dataclass
+class RxPacket:
+    src: int              # 16-bit source address (low 16 bits if 64-bit)
+    rssi: int | None      # positive magnitude; dBm = -rssi (None if frame carries none)
+    options: int
+    payload: bytes
+    kind: str = "RX16(0x81)"
+
+
+class XBee802:
+    def __init__(self, port: str, baud: int = 115200, debug: bool = False):
+        self.port = port
+        self.debug = debug
+        self.ser = serial.Serial(port, baud, timeout=0.05)
+        self._buf = bytearray()
+
+    # ---- low-level framing --------------------------------------------------
+    def _reopen(self, baud: int) -> None:
+        self.ser.close()
+        time.sleep(0.2)
+        self.ser = serial.Serial(self.port, baud, timeout=0.05)
+        self._buf.clear()
+
+    @staticmethod
+    def _checksum(data: bytes) -> int:
+        return 0xFF - (sum(data) & 0xFF)
+
+    def _write_frame(self, data: bytes) -> None:
+        n = len(data)
+        frame = bytes([0x7E, (n >> 8) & 0xFF, n & 0xFF]) + bytes(data)
+        frame += bytes([self._checksum(data)])
+        self.ser.write(frame)
+
+    def _read_frames(self) -> list[bytes]:
+        d = self.ser.read(512)
+        if d:
+            self._buf += d
+        out = []
+        buf = self._buf
+        while True:
+            i = buf.find(0x7E)
+            if i < 0:
+                buf.clear()
+                break
+            if i > 0:
+                del buf[:i]
+            if len(buf) < 3:
+                break
+            n = (buf[1] << 8) | buf[2]
+            if len(buf) < 3 + n + 1:
+                break
+            data = bytes(buf[3:3 + n])
+            chk = buf[3 + n]
+            del buf[:3 + n + 1]
+            if (sum(data) + chk) & 0xFF == 0xFF:
+                out.append(data)
+            elif self.debug:
+                print("  [xbee] bad checksum, dropped frame")
+        return out
+
+    # ---- AT commands --------------------------------------------------------
+    def send_at(self, cmd: str, value: bytes = b"", frame_id: int = 1) -> None:
+        data = bytes([0x08, frame_id, ord(cmd[0]), ord(cmd[1])]) + bytes(value)
+        self._write_frame(data)
+
+    def _wait_at(self, cmd: str, timeout: float):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            for f in self._read_frames():
+                if len(f) >= 5 and f[0] == 0x88 and f[2] == ord(cmd[0]) and f[3] == ord(cmd[1]):
+                    return f[4], bytes(f[5:])   # (status, value)
+            time.sleep(0.01)
+        return None, None
+
+    def at_query(self, cmd: str, timeout: float = 2.0):
+        self._read_frames()  # drain
+        self.send_at(cmd)
+        return self._wait_at(cmd, timeout)
+
+    def at_set(self, cmd: str, value: bytes, timeout: float = 2.0) -> bool:
+        self._read_frames()
+        self.send_at(cmd, value)
+        status, _ = self._wait_at(cmd, timeout)
+        return status == 0
+
+    # ---- transparent-mode fallback -----------------------------------------
+    def _expect_ok(self, timeout: float) -> bool:
+        t0 = time.time()
+        s = b""
+        while time.time() - t0 < timeout:
+            s += self.ser.read(16)
+            if s.endswith(b"OK\r"):
+                return True
+        return False
+
+    def _enter_cmd_mode(self) -> bool:
+        time.sleep(1.1)
+        self.ser.reset_input_buffer()
+        self.ser.write(b"+++")
+        return self._expect_ok(1.5)
+
+    def _cmd(self, line: str) -> bool:
+        self.ser.write(line.encode() + b"\r")
+        return self._expect_ok(1.5)
+
+    # ---- bootstrap + config -------------------------------------------------
+    def bootstrap(self) -> bool:
+        """Bring the module to API mode @ 115200 from any state."""
+        for b in BAUDS:                                   # pass 1: already API?
+            self._reopen(b)
+            status, _ = self.at_query("AP", timeout=0.7)
+            if status is not None:
+                if self.debug:
+                    print(f"  [xbee] API mode at {b} baud")
+                if b != 115200:
+                    self.at_set("BD", bytes([7]))
+                    self.at_set("WR", b"")
+                    self.at_set("AC", b"")
+                    self._reopen(115200)
+                return True
+        for b in BAUDS:                                   # pass 2: transparent?
+            self._reopen(b)
+            if self._enter_cmd_mode():
+                if self.debug:
+                    print(f"  [xbee] transparent at {b} baud; converting")
+                self._cmd("ATAP1")
+                self._cmd("ATBD7")
+                self._cmd("ATWR")
+                self._cmd("ATCN")
+                self._reopen(115200)
+                status, _ = self.at_query("AP", timeout=0.7)
+                if status is not None:
+                    return True
+        return False
+
+    def configure(self, pan: int, channel: int, my: int) -> dict:
+        """Force network params; returns which set calls succeeded."""
+        res = {
+            "MM": self.at_set("MM", bytes([0])),   # Digi Mode: clean framing + ACKs/retries
+            "AO": self.at_set("AO", bytes([2])),   # legacy 0x80/0x81 RX frames (carry RSSI)
+            "AP": self.at_set("AP", bytes([1])),   # non-escaped API (match the rover)
+            "ID": self.at_set("ID", bytes([(pan >> 8) & 0xFF, pan & 0xFF])),
+            "CH": self.at_set("CH", bytes([channel])),
+            "MY": self.at_set("MY", bytes([(my >> 8) & 0xFF, my & 0xFF])),
+            "AC": self.at_set("AC", b""),
+        }
+        return res
+
+    # ---- data path ----------------------------------------------------------
+    def tx16(self, dest: int, payload: bytes, options: int = 0, frame_id: int = 0) -> None:
+        data = bytes([0x01, frame_id, (dest >> 8) & 0xFF, dest & 0xFF, options]) + bytes(payload)
+        self._write_frame(data)
+
+    def broadcast(self, payload: bytes) -> None:
+        self.tx16(BROADCAST, payload)
+
+    def rx(self) -> list[RxPacket]:
+        """Return any receive packets since the last call (handles legacy + modern)."""
+        out = []
+        for f in self._read_frames():
+            if not f:
+                continue
+            api = f[0]
+            if api == 0x81 and len(f) >= 5:            # RX16 (legacy)
+                out.append(RxPacket((f[1] << 8) | f[2], f[3], f[4], bytes(f[5:]), "RX16(0x81)"))
+            elif api == 0x80 and len(f) >= 11:          # RX64 (legacy)
+                out.append(RxPacket((f[7] << 8) | f[8], f[9], f[10], bytes(f[11:]), "RX64(0x80)"))
+            elif api == 0x90 and len(f) >= 12:          # Receive Packet (modern)
+                out.append(RxPacket((f[9] << 8) | f[10], None, f[11], bytes(f[12:]), "RX(0x90)"))
+            elif api == 0x89:                           # TX status
+                print(f"  [xbee] TX status frame_id={f[1]} status={f[2]}")
+            else:
+                print(f"  [xbee] other frame api=0x{api:02X} data={f.hex()}")
+        return out
+
+    def close(self) -> None:
+        self.ser.close()

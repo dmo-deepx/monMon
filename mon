@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# monMon dev helper — wraps PlatformIO, which isn't on this machine's PATH.
+# Usage: ./mon <command> [extra pio args]   (run ./mon help for the list)
+set -euo pipefail
+
+PIO="$HOME/.platformio/penv/bin/pio"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ ! -x "$PIO" ]]; then
+  echo "error: PlatformIO not found at $PIO" >&2
+  echo "       install PlatformIO Core, or edit PIO= at the top of this script." >&2
+  exit 1
+fi
+
+# Put pio + its bundled tools on PATH for anything this script invokes, and
+# always operate on the monMon project regardless of the caller's cwd.
+export PATH="$HOME/.platformio/penv/bin:$PATH"
+cd "$PROJECT_DIR"
+
+cmd="${1:-build}"
+shift || true
+
+case "$cmd" in
+  build|b)      exec "$PIO" run "$@" ;;
+  upload|u)     exec "$PIO" run -t upload "$@" ;;
+  monitor|m)    exec "$PIO" device monitor "$@" ;;
+  run|flash|r)  exec "$PIO" run -t upload -t monitor "$@" ;;
+  clean|c)      exec "$PIO" run -t clean "$@" ;;
+  ports|p)      exec "$PIO" device list "$@" ;;
+  pio)          exec "$PIO" "$@" ;;
+  -h|--help|help)
+    cat <<'EOF'
+monMon dev helper
+usage: ./mon <command> [extra pio args]
+
+  build    (b)  compile firmware                     [default]
+  upload   (u)  compile + flash over USB
+  monitor  (m)  open serial monitor (115200 baud)
+  run      (r)  upload then monitor        (alias: flash)
+  clean    (c)  remove build artifacts
+  ports    (p)  list attached serial ports
+  pio ...       pass remaining args straight to pio
+
+examples:
+  ./mon                     # build
+  ./mon run                 # flash + watch serial
+  ./mon upload --upload-port /dev/cu.usbmodem1101
+EOF
+    ;;
+  *) exec "$PIO" "$cmd" "$@" ;;   # anything else -> raw pio subcommand
+esac

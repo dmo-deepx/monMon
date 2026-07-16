@@ -1,0 +1,15 @@
+[project]
+name = "monmon-base"
+version = "0.1.0"
+description = "monMon base station — XBee/NTRIP RTK relay for a rover swarm"
+requires-python = ">=3.10"
+dependencies = [
+    "pyserial>=3.5",
+]
+
+[project.scripts]
+monmon-link-test = "monmon_base.link_test:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,6 +1,11 @@
 .vscode
 .claude/settings.local.json
 example/arduino/CST328touch
+
+# Python / uv (base station)
+.venv/
+__pycache__/
+*.pyc
 # Prerequisites
 *.d
 
