@@ -22,6 +22,10 @@
 #include "monmon_config.h"
 #include "monmon_packet.h"
 
+// Set to 1 to bypass everything and just spam ASCII out Serial2 TX (GPIO43) so
+// an FTDI on that pin can confirm the UART actually drives it. Set back to 0.
+#define F9P_TX_TEST 0
+
 // ---- peripherals ----------------------------------------------------------
 TFT_eSPI     tft = TFT_eSPI();
 XBee         xbee = XBee();
@@ -36,6 +40,7 @@ uint8_t  txSeq       = 0;
 uint32_t lastPosMs   = 0;
 uint32_t lastDispMs  = 0;
 uint32_t lastRtcmMs  = 0;
+uint32_t lastDiagMs  = 0;
 int      downRssi    = 0;        // positive magnitude; dBm = -downRssi
 bool     haveRssi    = false;
 
@@ -264,10 +269,29 @@ static void sendPacket(uint8_t type, const uint8_t* data, size_t len) {
 // ===========================================================================
 //  F9P helpers  (auto-baud bootstrap + UBX config)
 // ===========================================================================
-static bool f9pSawData(uint32_t ms) {
+// True if a checksum-valid NMEA sentence arrives within the window. (Mere byte
+// presence isn't enough — garbage at the wrong baud also "has bytes".)
+static bool f9pValidNmea(uint32_t ms) {
   uint32_t t0 = millis();
+  char line[100];
+  int len = -1;                                  // -1 = not inside a sentence
   while (millis() - t0 < ms) {
-    if (Serial2.available()) return true;
+    while (Serial2.available()) {
+      char c = Serial2.read();
+      if (c == '$') {
+        len = 0;
+      } else if (len >= 0 && (c == '\r' || c == '\n')) {
+        if (len > 4 && line[len - 3] == '*') {   // ...*HH
+          uint8_t cs = 0;
+          for (int i = 0; i < len - 3; i++) cs ^= (uint8_t)line[i];
+          char hex[3] = { line[len - 2], line[len - 1], 0 };
+          if ((uint8_t)strtol(hex, nullptr, 16) == cs) return true;
+        }
+        len = -1;
+      } else if (len >= 0 && len < (int)sizeof(line) - 1) {
+        line[len++] = c;
+      }
+    }
   }
   return false;
 }
@@ -282,25 +306,50 @@ static void ubxSend(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t le
   Serial2.write(b);
 }
 
+// UBX-CFG-VALSET (RAM): switch UART1 to 115200. Applied blind at the current baud.
 static void f9pSetBaud115200() {
-  // UBX-CFG-VALSET: CFG-UART1-BAUDRATE (0x40520001) = 115200, layers RAM+BBR+Flash
-  uint8_t p[12] = { 0x00, 0x07, 0x00, 0x00,
-                    0x01, 0x00, 0x52, 0x40,
-                    0x00, 0xC2, 0x01, 0x00 };
+  uint8_t p[12] = { 0x00, 0x01, 0x00, 0x00,          // version, layer=RAM, reserved
+                    0x01, 0x00, 0x52, 0x40,          // CFG-UART1-BAUDRATE (0x40520001)
+                    0x00, 0xC2, 0x01, 0x00 };        // = 115200
   ubxSend(0x06, 0x8A, p, sizeof(p));
+}
+
+// UBX-CFG-VALSET (RAM): make any F9P plug-and-play — NMEA out + UBX/NMEA/RTCM3 in
+// on UART1, and GGA emitted every nav epoch (regardless of prior config).
+static void f9pConfigure() {
+  const uint8_t cfg[] = {
+    0x00, 0x01, 0x00, 0x00,                          // version, layer=RAM, reserved
+    0x01, 0x00, 0x73, 0x10, 0x01,                    // CFG-UART1INPROT-UBX    = 1
+    0x02, 0x00, 0x73, 0x10, 0x01,                    // CFG-UART1INPROT-NMEA   = 1
+    0x04, 0x00, 0x73, 0x10, 0x01,                    // CFG-UART1INPROT-RTCM3X = 1 (corrections in)
+    0x01, 0x00, 0x74, 0x10, 0x01,                    // CFG-UART1OUTPROT-UBX   = 1
+    0x02, 0x00, 0x74, 0x10, 0x01,                    // CFG-UART1OUTPROT-NMEA  = 1
+    0xBB, 0x00, 0x91, 0x20, 0x01,                    // CFG-MSGOUT-NMEA_ID_GGA_UART1 = 1
+  };
+  ubxSend(0x06, 0x8A, cfg, sizeof(cfg));
 }
 
 static void beginF9P() {
   Serial2.begin(F9P_BAUD, SERIAL_8N1, F9P_RX_PIN, F9P_TX_PIN);
-  if (!f9pSawData(1500)) {
-    Serial.println("[F9P] silent at target baud — bootstrapping from default");
+  if (!f9pValidNmea(1500)) {
+    // No valid NMEA at 115200: the F9P may be at its 38400 default and/or have
+    // NMEA disabled. Blindly set baud + config from 38400, then reopen at 115200.
+    Serial.println("[F9P] no valid NMEA at 115200; configuring from 38400 default");
     Serial2.begin(F9P_BAUD_DEFAULT, SERIAL_8N1, F9P_RX_PIN, F9P_TX_PIN);
     delay(100);
     f9pSetBaud115200();
-    delay(200);
+    f9pConfigure();
+    delay(300);
     Serial2.begin(F9P_BAUD, SERIAL_8N1, F9P_RX_PIN, F9P_TX_PIN);
+    delay(100);
   }
-  Serial.println("[F9P] ready");
+  f9pConfigure();                                    // ensure messages are on at 115200
+  delay(400);
+  if (f9pValidNmea(1500))
+    Serial.println("[F9P] ready — valid NMEA flowing");
+  else
+    Serial.println("[F9P] WARNING: no valid NMEA — check wiring (GPIO44<-F9P TX, "
+                   "GPIO43->F9P RX, shared GND) and power");
 }
 
 // ===========================================================================
@@ -326,64 +375,87 @@ static void drawField(int y, int h) {
   tft.fillRect(0, y, tft.width(), h, TFT_BLACK);
 }
 
+// Split s into up to two lines of <= maxc chars, breaking on a space if possible.
+static void wrapTwoLines(const char* s, char* l1, char* l2, size_t maxc) {
+  size_t n = strlen(s);
+  if (n <= maxc) {
+    memcpy(l1, s, n);
+    l1[n] = 0;
+    l2[0] = 0;
+    return;
+  }
+  size_t split = maxc;
+  for (size_t i = maxc; i > 0; i--) {
+    if (s[i] == ' ') { split = i; break; }
+  }
+  memcpy(l1, s, split);
+  l1[split] = 0;
+  const char* rest = s + split;
+  while (*rest == ' ') rest++;
+  size_t rlen = strlen(rest);
+  if (rlen > maxc) rlen = maxc;
+  memcpy(l2, rest, rlen);
+  l2[rlen] = 0;
+}
+
 static void drawStatus() {
   int q = atoi(ggaQuality.value());
   const char* qtxt; uint16_t qcol;
   qualityLabel(q, qtxt, qcol);
 
   // fix quality (big)
-  drawField(56, 34);
+  drawField(56, 30);
   tft.setTextFont(4);
   tft.setTextColor(qcol, TFT_BLACK);
   tft.setCursor(6, 58);
   tft.print(qtxt);
 
   // sats + hdop
-  drawField(96, 20);
+  drawField(90, 18);
   tft.setTextFont(2);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.setCursor(6, 98);
+  tft.setCursor(6, 90);
   tft.printf("Sat %lu  HDOP %.1f",
              (unsigned long)gps.satellites.value(),
              gps.hdop.isValid() ? gps.hdop.hdop() : 99.9);
 
-  // position
-  drawField(118, 40);
+  // position: lat / lon / alt
+  drawField(108, 58);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(6, 120);
   if (gps.location.isValid()) {
-    tft.printf("Lat %.7f", gps.location.lat());
-    tft.setCursor(6, 138);
-    tft.printf("Lon %.7f", gps.location.lng());
+    tft.setCursor(6, 108); tft.printf("Lat %.7f", gps.location.lat());
+    tft.setCursor(6, 126); tft.printf("Lon %.7f", gps.location.lng());
+    tft.setCursor(6, 144);
+    if (gps.altitude.isValid()) tft.printf("Alt %.1f m", gps.altitude.meters());
+    else                        tft.print("Alt --");
   } else {
-    tft.print("Lat --");
-    tft.setCursor(6, 138);
-    tft.print("Lon --");
+    tft.setCursor(6, 108); tft.print("Lat --");
+    tft.setCursor(6, 126); tft.print("Lon --");
+    tft.setCursor(6, 144); tft.print("Alt --");
   }
 
   // link RSSI + bar
-  drawField(168, 44);
-  tft.setCursor(6, 170);
+  drawField(168, 40);
+  tft.setCursor(6, 168);
   if (haveRssi) {
     uint16_t rc = (downRssi >= RSSI_BAD) ? TFT_RED
                 : (downRssi >= RSSI_WARN) ? TFT_ORANGE : TFT_GREEN;
     tft.setTextColor(rc, TFT_BLACK);
     tft.printf("Link %d dBm", -downRssi);
-    // bar: -40 dBm (full) .. -100 dBm (empty)
-    float frac = (100.0f - downRssi) / 60.0f;
+    float frac = (100.0f - downRssi) / 60.0f;   // -40 dBm full .. -100 dBm empty
     if (frac < 0) frac = 0;
     if (frac > 1) frac = 1;
     int bw = tft.width() - 12;
-    tft.drawRect(6, 192, bw, 14, TFT_DARKGREY);
-    tft.fillRect(8, 194, (int)((bw - 4) * frac), 10, rc);
+    tft.drawRect(6, 188, bw, 12, TFT_DARKGREY);
+    tft.fillRect(8, 190, (int)((bw - 4) * frac), 8, rc);
   } else {
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
     tft.print("Link --");
   }
 
   // corrections age
-  drawField(214, 20);
-  tft.setCursor(6, 216);
+  drawField(206, 18);
+  tft.setCursor(6, 206);
   if (lastRtcmMs == 0) {
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
     tft.print("RTCM --");
@@ -393,18 +465,20 @@ static void drawStatus() {
     tft.printf("RTCM %.1fs", age / 1000.0f);
   }
 
-  // base info (telemetry text from the base station)
-  drawField(238, 62);
+  // base info (telemetry text), wrapped to two lines
+  drawField(228, 58);
   tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
-  tft.setCursor(6, 240);
+  tft.setCursor(6, 228);
   tft.print("Base:");
-  tft.setCursor(6, 258);
   if (haveBaseInfo && millis() - lastBaseMs < 5000) {
+    char l1[24], l2[24];
+    wrapTwoLines(baseInfo, l1, l2, 22);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.print(baseInfo);
+    tft.setCursor(6, 248); tft.print(l1);
+    tft.setCursor(6, 266); tft.print(l2);
   } else {
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.print(haveBaseInfo ? "(stale)" : "--");
+    tft.setCursor(6, 248); tft.print(haveBaseInfo ? "(stale)" : "--");
   }
 }
 
@@ -414,6 +488,19 @@ static void drawStatus() {
 void setup() {
   Serial.begin(115200);
   delay(2500);            // let the USB-CDC monitor reconnect so boot logs are visible
+
+#if F9P_TX_TEST
+  // Pin sanity check: drive GPIO43 (Serial2 TX) with readable ASCII forever.
+  // On the FTDI (RX <- GPIO43, GND shared) at 115200 you should see clean lines.
+  Serial2.begin(F9P_BAUD, SERIAL_8N1, F9P_RX_PIN, F9P_TX_PIN);
+  Serial.printf("[TXtest] spamming ASCII on GPIO%d (Serial2 TX) @ %d baud\n",
+                F9P_TX_PIN, F9P_BAUD);
+  for (uint32_t n = 0;; n++) {
+    Serial2.printf("monMon GPIO%d TX test #%lu @ %d baud\r\n", F9P_TX_PIN, n, F9P_BAUD);
+    Serial.printf("[TXtest] sent #%lu\n", n);
+    delay(500);
+  }
+#endif
 
   pinMode(PIN_POWER_ON, OUTPUT);
   digitalWrite(PIN_POWER_ON, HIGH);
@@ -526,6 +613,19 @@ void loop() {
 
   btn1.tick();
   btn2.tick();
+
+  // ---- F9P health diagnostic (1 Hz) ----
+  if (millis() - lastDiagMs >= 1000) {
+    lastDiagMs = millis();
+    Serial.printf("[gps] chars=%lu fixSentences=%lu cksumErr=%lu | q=%d sats=%lu ",
+                  gps.charsProcessed(), gps.sentencesWithFix(), gps.failedChecksum(),
+                  atoi(ggaQuality.value()), (unsigned long)gps.satellites.value());
+    if (gps.location.isValid())
+      Serial.printf("lat=%.7f lon=%.7f alt=%.1fm\n",
+                    gps.location.lat(), gps.location.lng(), gps.altitude.meters());
+    else
+      Serial.println("LLA=--");
+  }
 
   // ---- display ----
   if (millis() - lastDispMs >= DISPLAY_MS) {

@@ -31,6 +31,13 @@ class XBee802:
         self.debug = debug
         self.ser = serial.Serial(port, baud, timeout=0.05)
         self._buf = bytearray()
+        # throughput counters (cumulative)
+        self.tx_wire = 0      # bytes written to the serial link (full escaped frames)
+        self.tx_frames = 0
+        self.tx_app = 0       # application payload bytes sent (over the air)
+        self.rx_wire = 0      # bytes read from the serial link
+        self.rx_frames = 0
+        self.rx_app = 0       # application payload bytes received
 
     # ---- low-level framing --------------------------------------------------
     def _reopen(self, baud: int) -> None:
@@ -60,7 +67,10 @@ class XBee802:
         return bytes(out)
 
     def _write_frame(self, data: bytes) -> None:
-        self.ser.write(self._encode_frame(data))
+        enc = self._encode_frame(data)
+        self.ser.write(enc)
+        self.tx_wire += len(enc)
+        self.tx_frames += 1
 
     @classmethod
     def _extract_frames(cls, buf: bytearray) -> list[bytes]:
@@ -113,6 +123,7 @@ class XBee802:
         d = self.ser.read(512)
         if d:
             self._buf += d
+            self.rx_wire += len(d)
         return self._extract_frames(self._buf)
 
     # ---- AT commands --------------------------------------------------------
@@ -211,6 +222,7 @@ class XBee802:
     # ---- data path ----------------------------------------------------------
     def tx16(self, dest: int, payload: bytes, options: int = 0, frame_id: int = 0) -> None:
         data = bytes([0x01, frame_id, (dest >> 8) & 0xFF, dest & 0xFF, options]) + bytes(payload)
+        self.tx_app += len(payload)
         self._write_frame(data)
 
     def broadcast(self, payload: bytes) -> None:
@@ -230,9 +242,12 @@ class XBee802:
             elif api == 0x90 and len(f) >= 12:          # Receive Packet (modern)
                 out.append(RxPacket((f[9] << 8) | f[10], None, f[11], bytes(f[12:]), "RX(0x90)"))
             elif api == 0x89:                           # TX status
-                print(f"  [xbee] TX status frame_id={f[1]} status={f[2]}")
+                continue
             else:
-                print(f"  [xbee] other frame api=0x{api:02X} data={f.hex()}")
+                continue
+        for rp in out:
+            self.rx_frames += 1
+            self.rx_app += len(rp.payload)
         return out
 
     def close(self) -> None:
