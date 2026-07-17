@@ -5,11 +5,12 @@ to all rovers.  Live dashboard shows NTRIP status, per-rover link budget, and
 bandwidth budget.
 
 Usage:
-    uv run monmon-base [config.yaml]
+    uv run monmon-base [config.yaml] [--caster NAME] [--list]
 """
 
 from __future__ import annotations
 
+import argparse
 import glob
 import sys
 import time
@@ -56,17 +57,13 @@ def _render(cfg, xb, nt, rovers, bw, rtcm_bps, fwd_fps, ref_src, gga_age):
         f"MY {cfg.xbee.base_addr:04X}   {ui.utc()}",
     ]
     n = cfg.ntrip
+    label = f"{ui.BOLD}NTRIP{ui.RESET} {ui.CYAN}[{cfg.caster}]{ui.RESET} {n.host}:{n.port}/{n.mountpoint}"
     if nt.connected:
-        out.append(
-            f"{ui.BOLD}NTRIP{ui.RESET} {n.host}:{n.port}/{n.mountpoint}  "
-            f"{ui.GREEN}CONNECTED{ui.RESET}  in {rtcm_bps:.0f} B/s  fwd {fwd_fps:.0f} fr/s"
-        )
+        out.append(f"{label}  {ui.GREEN}CONNECTED{ui.RESET}  "
+                   f"in {rtcm_bps:.0f} B/s  fwd {fwd_fps:.0f} fr/s")
     else:
         err = f" ({nt.last_error})" if nt.last_error else ""
-        out.append(
-            f"{ui.BOLD}NTRIP{ui.RESET} {n.host}:{n.port}/{n.mountpoint}  "
-            f"{ui.RED}DISCONNECTED{ui.RESET}{ui.DIM}{err}{ui.RESET}"
-        )
+        out.append(f"{label}  {ui.RED}DISCONNECTED{ui.RESET}{ui.DIM}{err}{ui.RESET}")
     src = (f"{n.gga_source} 0x{ref_src:04X}" if n.gga_source == "rover" and ref_src
            else n.gga_source)
     age = f"{gga_age:.0f}s ago" if gga_age is not None else "never"
@@ -116,7 +113,21 @@ def _render(cfg, xb, nt, rovers, bw, rtcm_bps, fwd_fps, ref_src, gga_age):
 
 
 def main() -> None:
-    cfg = config.load(sys.argv[1] if len(sys.argv) > 1 else "config.yaml")
+    ap = argparse.ArgumentParser(prog="monmon-base", description="monMon base station bridge")
+    ap.add_argument("config", nargs="?", default="config.yaml", help="YAML config path")
+    ap.add_argument("-C", "--caster", help="caster name from config (overrides 'default')")
+    ap.add_argument("-l", "--list", action="store_true", help="list configured casters and exit")
+    args = ap.parse_args()
+
+    if args.list:
+        names, default = config.available_casters(args.config)
+        print("casters:" if names else "no casters configured")
+        for n in names:
+            print(f"  {n}{'   (default)' if n == default else ''}")
+        return
+
+    cfg = config.load(args.config, caster=args.caster)
+    print(f"[base] caster '{cfg.caster}' → {cfg.ntrip.host}:{cfg.ntrip.port}/{cfg.ntrip.mountpoint}")
     port = _resolve_port(cfg.xbee.port)
 
     print(f"[base] opening XBee on {port} …")

@@ -1,5 +1,5 @@
 # monMon base station configuration.
-# Copy to config.yaml and fill in your caster:  cp config.example.yaml config.yaml
+# Copy to config.yaml and fill in your caster(s):  cp config.example.yaml config.yaml
 # config.yaml is gitignored so credentials never land in the repo.
 
 xbee:
@@ -9,11 +9,8 @@ xbee:
   base_addr: 0x0000
 
 ntrip:
-  host: "caster.example.com"
+  # ---- common defaults (each caster below inherits, and may override) ----
   port: 2101
-  mountpoint: "MOUNTPOINT"
-  username: "username"
-  password: "password"
   version: 2            # NTRIP protocol version: 1 or 2
   https: false
   gga_interval: 10      # seconds between GGA sentences sent upstream
@@ -21,7 +18,18 @@ ntrip:
   #   rover  = use a rover's live GGA received over the radio  [recommended]
   #   static = use the fixed lat/lon/alt below (fixed work site)
   gga_source: rover
-  primary_rover: 0x0000 # 0 = use whichever rover reported most recently; else pin one (e.g. 0xA994)
+  primary_rover: 0x0000 # 0 = use whichever rover reported most recently; else pin one
   static_lat: 0.0
   static_lon: 0.0
   static_alt: 0.0
+
+  default: example      # caster used when --caster is not given
+
+  # ---- named casters (override the common fields above) ----
+  # Select at runtime:  uv run monmon-base --caster <name>   ( --list to see them )
+  casters:
+    example:
+      host: "caster.example.com"
+      mountpoint: "MOUNTPOINT"
+      username: "username"
+      password: "password"
