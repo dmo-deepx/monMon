@@ -6,6 +6,9 @@ example/arduino/CST328touch
 .venv/
 __pycache__/
 *.pyc
+
+# base station credentials
+base/config.yaml
 # Prerequisites
 *.d
 

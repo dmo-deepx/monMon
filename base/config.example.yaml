@@ -1,0 +1,27 @@
+# monMon base station configuration.
+# Copy to config.yaml and fill in your caster:  cp config.example.yaml config.yaml
+# config.yaml is gitignored so credentials never land in the repo.
+
+xbee:
+  port: auto            # "auto" picks the sole /dev/cu.usbserial* adapter
+  pan_id: 0x3332
+  channel: 0x0C
+  base_addr: 0x0000
+
+ntrip:
+  host: "caster.example.com"
+  port: 2101
+  mountpoint: "MOUNTPOINT"
+  username: "username"
+  password: "password"
+  version: 2            # NTRIP protocol version: 1 or 2
+  https: false
+  gga_interval: 10      # seconds between GGA sentences sent upstream
+  # Reference position sent to the caster (VRS / nearest-base selection):
+  #   rover  = use a rover's live GGA received over the radio  [recommended]
+  #   static = use the fixed lat/lon/alt below (fixed work site)
+  gga_source: rover
+  primary_rover: 0x0000 # 0 = use whichever rover reported most recently; else pin one (e.g. 0xA994)
+  static_lat: 0.0
+  static_lon: 0.0
+  static_alt: 0.0

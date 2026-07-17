@@ -211,7 +211,8 @@ static bool xbeeBootstrap() {
 }
 
 // Force this swarm's network params (volatile — reapplied every boot, no flash wear).
-static void configureXBeeNetwork() {
+// Returns true if every AT write was acknowledged OK.
+static bool configureXBeeNetwork() {
   delay(200);
   while (Serial1.available()) Serial1.read();       // let post-conversion frames drain
 
@@ -249,6 +250,8 @@ static void configureXBeeNetwork() {
   Serial.print(" MY=");
   for (int i = 0; i < n; i++) Serial.printf("%02X", v[i]);
   Serial.printf(" (wanted MY=%04X)\n", roverAddr);
+
+  return bMM && bAO && bAP && bID && bCH && bMY && bAC;
 }
 
 // Send an application packet to the base, fragmenting if larger than one frame.
@@ -329,7 +332,8 @@ static void f9pConfigure() {
   ubxSend(0x06, 0x8A, cfg, sizeof(cfg));
 }
 
-static void beginF9P() {
+// Returns true if the F9P is producing valid NMEA after configuration.
+static bool beginF9P() {
   Serial2.begin(F9P_BAUD, SERIAL_8N1, F9P_RX_PIN, F9P_TX_PIN);
   if (!f9pValidNmea(1500)) {
     // No valid NMEA at 115200: the F9P may be at its 38400 default and/or have
@@ -345,11 +349,13 @@ static void beginF9P() {
   }
   f9pConfigure();                                    // ensure messages are on at 115200
   delay(400);
-  if (f9pValidNmea(1500))
+  bool ok = f9pValidNmea(1500);
+  if (ok)
     Serial.println("[F9P] ready — valid NMEA flowing");
   else
     Serial.println("[F9P] WARNING: no valid NMEA — check wiring (GPIO44<-F9P TX, "
                    "GPIO43->F9P RX, shared GND) and power");
+  return ok;
 }
 
 // ===========================================================================
@@ -373,6 +379,32 @@ static void qualityLabel(int q, const char*& text, uint16_t& color) {
 
 static void drawField(int y, int h) {
   tft.fillRect(0, y, tft.width(), h, TFT_BLACK);
+}
+
+// Boot-status line, updated step by step so you can watch XBee configure, then
+// F9P. State per slot: 2=configuring, 1=OK, 0=FAIL, -1=waiting. Drawn during
+// setup in the y22..42 band; drawStatus() never touches it, so it stays put.
+enum { CFG_WAIT = -1, CFG_FAIL = 0, CFG_OK = 1, CFG_BUSY = 2 };
+
+static void drawCfgSlot(int state) {
+  switch (state) {
+    case CFG_BUSY: tft.setTextColor(TFT_YELLOW, TFT_BLACK);   tft.print("CFG");  break;
+    case CFG_OK:   tft.setTextColor(TFT_GREEN, TFT_BLACK);    tft.print("OK");   break;
+    case CFG_FAIL: tft.setTextColor(TFT_RED, TFT_BLACK);      tft.print("FAIL"); break;
+    default:       tft.setTextColor(TFT_DARKGREY, TFT_BLACK); tft.print("--");   break;
+  }
+}
+
+static void drawCfgLine(int xbee, int f9p) {
+  tft.fillRect(0, 22, tft.width(), 20, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setCursor(6, 24);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.print("XBee ");
+  drawCfgSlot(xbee);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.print("   F9P ");
+  drawCfgSlot(f9p);
 }
 
 // Split s into up to two lines of <= maxc chars, breaking on a space if possible.
@@ -512,32 +544,30 @@ void setup() {
     roverAddr = (a == 0x0000 || a == 0xFFFF) ? 0x0001 : a;
   }
 
-  // display
+  // display header: "monMon 0xADDR" + a boot-status line
   tft.init();
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
-  tft.setTextFont(4);
-  tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
-  tft.setCursor(6, 6);
-  tft.print("monMon");
   tft.setTextFont(2);
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.setCursor(6, 36);
-  tft.printf("rover 0x%04X", roverAddr);
+  tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
+  tft.setCursor(6, 2);
+  tft.printf("monMon  0x%04X", roverAddr);
 
-  // radios — bootstrap the XBee from any state, then apply network params
-  tft.setCursor(6, 36);
-  tft.printf("rover 0x%04X  XBee...", roverAddr);
+  // radios — configure the XBee first, then the F9P, updating the status line
+  // at each step so progress is visible.
+  drawCfgLine(CFG_BUSY, CFG_WAIT);            // XBee configuring, F9P waiting
+  bool xbeeOk = false;
   if (xbeeBootstrap()) {
     xbeeDiag();
-    configureXBeeNetwork();
+    xbeeOk = configureXBeeNetwork();
   } else {
     Serial.println("[XBee] bootstrap FAILED — check wiring (DOUT->17, DIN->18)");
   }
-  tft.fillRect(0, 34, tft.width(), 18, TFT_BLACK);
-  tft.setCursor(6, 36);
-  tft.printf("rover 0x%04X", roverAddr);
-  beginF9P();
+
+  drawCfgLine(xbeeOk ? CFG_OK : CFG_FAIL, CFG_BUSY);   // XBee done, F9P configuring
+  bool f9pOk = beginF9P();
+
+  drawCfgLine(xbeeOk ? CFG_OK : CFG_FAIL, f9pOk ? CFG_OK : CFG_FAIL);   // both done
 
   // buttons -> stakeout mark
   btn1.attachClick(onMark);
