@@ -15,6 +15,41 @@ import threading
 import time
 
 
+class _Dechunker:
+    """Incremental HTTP/1.1 chunked-transfer decoder (NTRIP v2 casters use it)."""
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.remaining = 0        # bytes left in the current chunk body
+
+    def feed(self, data: bytes) -> bytes:
+        self.buf += data
+        out = bytearray()
+        while True:
+            if self.remaining > 0:
+                take = min(self.remaining, len(self.buf))
+                if take == 0:
+                    break
+                out += self.buf[:take]
+                del self.buf[:take]
+                self.remaining -= take
+            else:
+                idx = self.buf.find(b"\r\n")
+                if idx < 0:
+                    break
+                line = bytes(self.buf[:idx]).strip()
+                del self.buf[: idx + 2]
+                if not line:            # the CRLF that trails a chunk body
+                    continue
+                try:
+                    self.remaining = int(line.split(b";")[0], 16)
+                except ValueError:
+                    break               # not chunked after all; stop trying
+                if self.remaining == 0:
+                    break               # final chunk
+        return bytes(out)
+
+
 class NtripClient(threading.Thread):
     def __init__(self, cfg):
         super().__init__(daemon=True)
@@ -59,13 +94,14 @@ class NtripClient(threading.Thread):
         sock.settimeout(15)
         data = b""
         initial = b""
+        chunked = False
         while True:
             chunk = sock.recv(4096)
             if not chunk:
                 raise ConnectionError("caster closed during handshake")
             data += chunk
             if data[:3] == b"ICY" and b"\r\n" in data:
-                hdr, _, initial = data.partition(b"\r\n")
+                hdr, _, initial = data.partition(b"\r\n")   # v1: raw stream, never chunked
                 if b"200" not in hdr:
                     raise ConnectionError(f"caster refused: {hdr!r}")
                 break
@@ -76,22 +112,30 @@ class NtripClient(threading.Thread):
                     raise ConnectionError("got sourcetable — check mountpoint name")
                 if b"200" not in first:
                     raise ConnectionError(f"caster refused: {first!r}")
+                chunked = b"chunked" in hdr.lower()          # NTRIP v2 may use HTTP chunked
                 break
             if len(data) > 8192:
                 raise ConnectionError("no valid handshake from caster")
-        return sock, initial
+        return sock, initial, chunked
 
     def run(self):
         while not self._stop.is_set():
             try:
-                sock, initial = self._open()
+                sock, initial, chunked = self._open()
                 with self._lock:
                     self._sock = sock
                 self.connected = True
                 self.last_error = ""
+                dechunk = _Dechunker() if chunked else None
+
+                def emit(raw: bytes) -> None:
+                    data = dechunk.feed(raw) if dechunk else raw
+                    if data:
+                        self.rtcm.put(data)
+                        self.bytes_in += len(data)
+
                 if initial:
-                    self.rtcm.put(initial)
-                    self.bytes_in += len(initial)
+                    emit(initial)
                 sock.settimeout(1.0)
                 while not self._stop.is_set():
                     try:
@@ -100,8 +144,7 @@ class NtripClient(threading.Thread):
                         continue
                     if not chunk:
                         raise ConnectionError("stream closed by caster")
-                    self.rtcm.put(chunk)
-                    self.bytes_in += len(chunk)
+                    emit(chunk)
             except Exception as e:  # noqa: BLE001 — surface any failure, then retry
                 self.connected = False
                 self.last_error = str(e)

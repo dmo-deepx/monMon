@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 monmon-base = "monmon_base.bridge:main"
+monmon-caster-check = "monmon_base.caster_check:main"
 monmon-link-test = "monmon_base.link_test:main"
 
 [build-system]

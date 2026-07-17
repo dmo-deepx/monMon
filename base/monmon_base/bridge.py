@@ -15,7 +15,7 @@ import glob
 import sys
 import time
 
-from . import config, packet, ui
+from . import config, packet, rtcm, ui
 from .ntrip import NtripClient, make_gga
 from .xbee import XBee802
 
@@ -49,7 +49,7 @@ def _gga_quality(gga: str) -> int:
         return 0
 
 
-def _render(cfg, xb, nt, rovers, bw, rtcm_bps, fwd_fps, ref_src, gga_age):
+def _render(cfg, xb, nt, rovers, bw, rtcm_bps, fwd_fps, ref_src, gga_age, scanner):
     now = time.time()
     out = [
         f"{ui.BOLD}{ui.CYAN}monMon base{ui.RESET}  "
@@ -68,6 +68,17 @@ def _render(cfg, xb, nt, rovers, bw, rtcm_bps, fwd_fps, ref_src, gga_age):
            else n.gga_source)
     age = f"{gga_age:.0f}s ago" if gga_age is not None else "never"
     out.append(f"{ui.DIM}GGA: src {src}  ·  sent {nt.gga_sent} ({age}){ui.RESET}")
+    if scanner.total == 0 and nt.bytes_in > 0:
+        head = scanner.head
+        hexs = head[:24].hex()
+        asc = "".join(chr(c) if 32 <= c < 127 else "." for c in head[:24])
+        proto = ("UBX" if head[:2] == b"\xb5\x62" else "RTCM3" if head[:1] == b"\xd3"
+                 else "TEXT" if head[:1].isalpha() else "?")
+        out.append(f"{ui.RED}RTCM: 0 parsed{ui.RESET} {ui.DIM}(looks like {proto}, "
+                   f"bad_crc={scanner.bad_crc}) head={hexs} [{asc}]{ui.RESET}")
+    elif scanner.total or nt.connected:
+        warn = "" if scanner.has_base_position() else f"  {ui.RED}NO base pos (1005/1006)!{ui.RESET}"
+        out.append(f"{ui.DIM}RTCM: {scanner.summary()}  bad_crc={scanner.bad_crc}{ui.RESET}{warn}")
     out.append("")
     out.append(
         f"{ui.BOLD}{'ROVER':<8}{'RSSI':>8}{'MARGIN':>8}  {'LINK':<14}  "
@@ -146,6 +157,7 @@ def main() -> None:
     rovers: dict[int, dict] = {}
     ref_gga: str | None = None
     ref_src = 0
+    scanner = rtcm.RtcmScanner()
     rtcm_buf = bytearray()
     rtcm_seq = 0
     fwd_frames = 0
@@ -178,7 +190,9 @@ def main() -> None:
 
             # ---- RTCM from caster -> broadcast to rovers ----
             while not nt.rtcm.empty():
-                rtcm_buf += nt.rtcm.get_nowait()
+                chunk = nt.rtcm.get_nowait()
+                rtcm_buf += chunk
+                scanner.feed(chunk)
             if rtcm_buf:
                 take = bytes(rtcm_buf[:MAX_FLUSH])
                 del rtcm_buf[:MAX_FLUSH]
@@ -222,7 +236,7 @@ def main() -> None:
                 prev_rtcm_in = nt.bytes_in
                 prev_fwd = fwd_frames
                 gga_age = (now - gga_sent_at) if gga_sent_at else None
-                _render(cfg, xb, nt, rovers, bw, rtcm_bps, fwd_fps, ref_src, gga_age)
+                _render(cfg, xb, nt, rovers, bw, rtcm_bps, fwd_fps, ref_src, gga_age, scanner)
 
             time.sleep(0.02)
     except KeyboardInterrupt:
